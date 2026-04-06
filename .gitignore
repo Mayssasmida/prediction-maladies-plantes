@@ -1,0 +1,23 @@
+# Modèle IA (trop lourd pour GitHub)
+*.h5
+*.pkl
+
+# Dataset PlantVillage (trop lourd)
+PlantVillage/
+plantvillage/
+
+# Images reçues
+images_recues/
+
+# Environnement Python
+tf_env/
+venv/
+__pycache__/
+*.pyc
+
+# Fichiers système
+.DS_Store
+Thumbs.db
+
+# CSV historique
+historique_plante.csv
