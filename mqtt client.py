@@ -1,184 +1,151 @@
-"""
-mqtt_client.py — Réception des images + envoi JSON vers Node-RED
-================================================================
-Ce script reçoit des images via MQTT (topic: plante/image),
-prédit la maladie avec le modèle CNN, puis publie les résultats
-en JSON sur plusieurs topics que Node-RED va écouter.
-
-Topics publiés vers Node-RED :
-  plante/nodered/prediction  → résultat complet en JSON
-  plante/nodered/statut      → statut simple (sain/risque_modere/risque_eleve)
-  plante/nodered/alerte      → message d'alerte si risque élevé
-  plante/nodered/stats       → statistiques globales (compteurs)
-"""
-
-import os
-import json
-import base64
-import io
-import numpy as np
-import pandas as pd
-from datetime import datetime
-from PIL import Image
-import tensorflow as tf
-import paho.mqtt.client as mqtt
+import network
+import time
+import ubinascii
+import ujson
+import machine
+from umqtt.simple import MQTTClient
 
 # ─────────────────────────────────────────
-# 1. CHARGEMENT DU MODÈLE ET DES CLASSES
+# WIFI CONFIG
 # ─────────────────────────────────────────
-print("⏳ Chargement du modèle CNN...")
-model = tf.keras.models.load_model("plant_disease_model.h5")
 
-with open("class_names.json", "r") as f:
-    class_names = json.load(f)  # {0: "Apple___Apple_scab", ...}
-
-def format_class_name(raw_name):
-    return raw_name.replace("___", " - ").replace("_", " ")
-
-print(f"✅ Modèle prêt — {len(class_names)} classes")
+WIFI_SSID = "ooredoo-6CD791"
+WIFI_PASS = "9F1CEABFWg|64"
 
 # ─────────────────────────────────────────
-# 2. CONFIGURATION MQTT
+# MQTT CONFIG (STABLE)
 # ─────────────────────────────────────────
-BROKER = "broker.hivemq.com"
-PORT   = 1883
 
-# Topics d'entrée (depuis ESP32-CAM ou simulateur)
-TOPIC_IMAGE = "plante/image"
+BROKER = "broker.hivemq.com"   # ✅ PUBLIC BROKER STABLE
+PORT   = 1883                  # ✅ IMPORTANT (PAS 8883)
 
-# Topics de sortie vers Node-RED
-TOPIC_PREDICTION = "plante/nodered/prediction"
-TOPIC_STATUT     = "plante/nodered/statut"
-TOPIC_ALERTE     = "plante/nodered/alerte"
-TOPIC_STATS      = "plante/nodered/stats"
+TOPIC_IMAGE  = b"plante/image"
+TOPIC_RESULT = b"plante/resultat"
+
+client = None
 
 # ─────────────────────────────────────────
-# 3. INITIALISATION CSV ET COMPTEURS
+# WIFI CONNECTION
 # ─────────────────────────────────────────
-CSV_FILE = "historique_plante.csv"
 
-if not os.path.exists(CSV_FILE):
-    pd.DataFrame(columns=["date", "maladie", "confiance", "statut", "image_path"]) \
-      .to_csv(CSV_FILE, index=False)
+def connect_wifi():
+    wlan = network.WLAN(network.STA_IF)
 
-os.makedirs("images_recues", exist_ok=True)
+    # reset WiFi propre
+    wlan.active(False)
+    time.sleep(1)
+    wlan.active(True)
 
-# Compteurs globaux pour les stats
-compteurs = {"sain": 0, "risque_modere": 0, "risque_eleve": 0, "total": 0}
+    if wlan.isconnected():
+        wlan.disconnect()
 
-# ─────────────────────────────────────────
-# 4. PRÉDICTION
-# ─────────────────────────────────────────
-def predict_disease(image_bytes):
-    img = Image.open(io.BytesIO(image_bytes)).convert("RGB").resize((224, 224))
-    arr = np.expand_dims(np.array(img, dtype=np.float32) / 255.0, axis=0)
-    preds      = model.predict(arr, verbose=0)[0]
-    idx        = int(np.argmax(preds))
-    confidence = float(np.max(preds))
-    raw_name   = class_names[str(idx)]
-    disease    = format_class_name(raw_name)
+    print("📶 Connexion WiFi...")
+    wlan.connect(WIFI_SSID, WIFI_PASS)
 
-    if "healthy" in raw_name.lower():
-        statut = "sain"
-    elif confidence > 0.80:
-        statut = "risque_eleve"
+    timeout = 20
+    while not wlan.isconnected() and timeout > 0:
+        time.sleep(1)
+        timeout -= 1
+        print(".", end="")
+
+    if wlan.isconnected():
+        print("\n✅ WiFi OK :", wlan.ifconfig()[0])
+        return True
     else:
-        statut = "risque_modere"
-
-    return disease, confidence, statut
+        print("\n❌ WiFi échoué")
+        machine.reset()
 
 # ─────────────────────────────────────────
-# 5. CALLBACKS MQTT
+# MQTT CALLBACK
 # ─────────────────────────────────────────
-def on_connect(client, userdata, flags, rc):
-    if rc == 0:
-        print(f"✅ Connecté à {BROKER}")
-        client.subscribe(TOPIC_IMAGE)
-        print(f"📡 En écoute sur : {TOPIC_IMAGE}\n")
-    else:
-        print(f"❌ Erreur connexion (code {rc})")
 
-def on_message(client, userdata, msg):
-    global compteurs
-    print("📥 Image reçue — analyse en cours...")
+def on_message(topic, msg):
+    global client
+
+    print("\n📩 Message reçu :", topic.decode())
 
     try:
-        image_bytes = base64.b64decode(msg.payload)
-        date_now    = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        ts          = datetime.now().strftime("%Y%m%d_%H%M%S")
+        data = ujson.loads(msg)
 
-        # Sauvegarde image
-        img_path = f"images_recues/leaf_{ts}.jpg"
-        with open(img_path, "wb") as f:
-            f.write(image_bytes)
+        classe = data.get("classe", "?")
+        fichier = data.get("fichier", "?")
 
-        # Prédiction
-        disease, confidence, statut = predict_disease(image_bytes)
+        print("Classe :", classe)
+        print("Fichier:", fichier)
 
-        # Mise à jour compteurs
-        compteurs[statut] += 1
-        compteurs["total"] += 1
+        # simulation IA
+        resultat = "Healthy"
 
-        # ── Message principal (JSON complet) ──────────────────────────
-        payload_prediction = json.dumps({
-            "date":       date_now,
-            "maladie":    disease,
-            "confiance":  round(confidence * 100, 1),
-            "statut":     statut,
-            "image_path": img_path
-        }, ensure_ascii=False)
+        # publier résultat
+        client.publish(TOPIC_RESULT, ujson.dumps({
+            "classe_reelle": classe,
+            "prediction": resultat
+        }))
 
-        # ── Statut simple (pour gauge/LED dans Node-RED) ───────────────
-        payload_statut = json.dumps({
-            "statut":   statut,
-            "maladie":  disease,
-            "date":     date_now
-        }, ensure_ascii=False)
-
-        # ── Statistiques globales (pour graphiques) ────────────────────
-        payload_stats = json.dumps({
-            "total":         compteurs["total"],
-            "sain":          compteurs["sain"],
-            "risque_modere": compteurs["risque_modere"],
-            "risque_eleve":  compteurs["risque_eleve"],
-            "date":          date_now
-        }, ensure_ascii=False)
-
-        # Publication vers Node-RED
-        client.publish(TOPIC_PREDICTION, payload_prediction)
-        client.publish(TOPIC_STATUT,     payload_statut)
-        client.publish(TOPIC_STATS,      payload_stats)
-
-        # ── Alerte si risque élevé ─────────────────────────────────────
-        if statut == "risque_eleve":
-            payload_alerte = json.dumps({
-                "message":   f"ALERTE : {disease}",
-                "confiance": round(confidence * 100, 1),
-                "date":      date_now
-            }, ensure_ascii=False)
-            client.publish(TOPIC_ALERTE, payload_alerte)
-            print("🚨 Alerte envoyée !")
-
-        # Sauvegarde CSV
-        pd.DataFrame([[date_now, disease, round(confidence, 4), statut, img_path]],
-                     columns=["date", "maladie", "confiance", "statut", "image_path"]) \
-          .to_csv(CSV_FILE, mode="a", header=False, index=False)
-
-        print(f"  🌿 Maladie   : {disease}")
-        print(f"  📊 Confiance : {confidence*100:.1f}%")
-        print(f"  🏷️  Statut    : {statut}")
-        print(f"  📤 Publié sur Node-RED\n")
+        print("✔ Résultat envoyé :", resultat)
 
     except Exception as e:
-        print(f"❌ Erreur : {e}")
+        print("❌ Erreur traitement :", e)
 
 # ─────────────────────────────────────────
-# 6. DÉMARRAGE
+# MQTT CONNECT
 # ─────────────────────────────────────────
-client = mqtt.Client()
-client.on_connect = on_connect
-client.on_message = on_message
 
-print(f"🔌 Connexion à {BROKER}:{PORT}...")
-client.connect(BROKER, PORT)
-client.loop_forever()
+def connect_mqtt():
+    global client
+
+    client_id = ubinascii.hexlify(machine.unique_id()).decode()
+
+    print("🔌 Connexion MQTT...")
+
+    client = MQTTClient(
+        client_id=client_id,
+        server=BROKER,
+        port=PORT,
+        user=None,
+        password=None,
+        keepalive=60
+    )
+
+    client.set_callback(on_message)
+
+    try:
+        client.connect()
+        client.subscribe(TOPIC_IMAGE)
+
+        print("✅ MQTT connecté")
+        print("📡 Abonné à :", TOPIC_IMAGE.decode())
+
+        return client
+
+    except Exception as e:
+        print("❌ Erreur MQTT :", e)
+        time.sleep(3)
+        return connect_mqtt()
+
+# ─────────────────────────────────────────
+# MAIN LOOP
+# ─────────────────────────────────────────
+
+print("=== ESP32 MQTT CLIENT STABLE ===")
+
+connect_wifi()
+connect_mqtt()
+
+print("🔄 En attente de messages...\n")
+
+while True:
+    try:
+        client.check_msg()
+        time.sleep(0.2)
+
+    except OSError as e:
+        print("⚠ Connexion perdue :", e)
+        time.sleep(3)
+
+        connect_wifi()
+        connect_mqtt()
+
+    except Exception as e:
+        print("Erreur :", e)
+        time.sleep(2)

@@ -1,31 +1,42 @@
-"""
-mqtt_simulateur.py — Simulation d'un ESP32-CAM
-===============================================
-Ce script simule l'envoi d'images de feuilles via MQTT,
-comme le ferait un ESP32-CAM réel.
-Il pioche des images aléatoires depuis ton dossier PlantVillage.
-"""
-
 import os
-import base64
 import time
 import random
+import json
 import paho.mqtt.client as mqtt
+import ssl
 
 # ─────────────────────────────────────────
 # CONFIGURATION
 # ─────────────────────────────────────────
-BROKER       = "broker.hivemq.com"
-PORT         = 1883
-TOPIC_IMAGE  = "plante/image"
-DATASET_DIR  = "plantvillage"       # même dossier que pour l'entraînement
-INTERVALLE   = 10                   # secondes entre chaque envoi
+MQTT_BROKER = "broker.hivemq.com"
+PORT        = 8883
+USERNAME    = "mayssa"
+PASSWORD    = "Project@2026"
+TOPIC_IMAGE = "plante/image"
+DATASET_DIR = "plantvillage"
+INTERVALLE  = 10
 
 # ─────────────────────────────────────────
-# COLLECTE DE TOUTES LES IMAGES DISPONIBLES
+# CALLBACKS
+# ─────────────────────────────────────────
+def on_connect(client, userdata, flags, rc):
+    codes = {
+        0: "✅ Connecté avec succès",
+        1: "❌ Version protocole incorrecte",
+        2: "❌ Identifiant client invalide",
+        3: "❌ Serveur indisponible",
+        4: "❌ Mauvais username/password",
+        5: "❌ Non autorisé",
+    }
+    print(codes.get(rc, f"❌ Erreur inconnue: {rc}"))
+
+def on_publish(client, userdata, mid):
+    print(f"   ✔ Message confirmé (mid={mid})")
+
+# ─────────────────────────────────────────
+# COLLECTE DES IMAGES
 # ─────────────────────────────────────────
 print("📂 Recherche des images dans PlantVillage...")
-
 all_images = []
 for root, dirs, files in os.walk(DATASET_DIR):
     for file in files:
@@ -33,41 +44,88 @@ for root, dirs, files in os.walk(DATASET_DIR):
             all_images.append(os.path.join(root, file))
 
 if not all_images:
-    print(f"❌ Aucune image trouvée dans '{DATASET_DIR}'. Vérifie le chemin.")
+    print(f"❌ Aucune image trouvée dans '{DATASET_DIR}'.")
     exit(1)
 
-print(f"✅ {len(all_images)} images disponibles pour la simulation")
+print(f"✅ {len(all_images)} images trouvées\n")
 
 # ─────────────────────────────────────────
 # CONNEXION MQTT
 # ─────────────────────────────────────────
-client = mqtt.Client()
-client.connect(BROKER, PORT)
-print(f"🔌 Connecté à {BROKER}:{PORT}")
-print(f"📡 Publication sur le topic : {TOPIC_IMAGE}")
-print(f"⏱️  Intervalle : {INTERVALLE} secondes\n")
+client = mqtt.Client(client_id="simulateur_plantvillage", protocol=mqtt.MQTTv311)
+client.username_pw_set(USERNAME, PASSWORD)
+client.tls_set(tls_version=ssl.PROTOCOL_TLS)
+client.on_connect = on_connect
+client.on_publish = on_publish
+client.connect(MQTT_BROKER, PORT, keepalive=60)
+client.loop_start()
+time.sleep(1)
+
+print(f"📡 Topic : {TOPIC_IMAGE}")
+print(f"⏱️  Intervalle : {INTERVALLE}s\n")
+
+# ─────────────────────────────────────────
+# MALADIES SIMULÉES
+# ─────────────────────────────────────────
+MALADIES_SAINES = ["healthy", "Healthy"]
+NIVEAUX_CONFIANCE = {
+    "healthy": 95,
+    "Late_blight": 88,
+    "Early_blight": 82,
+    "Septoria_leaf_spot": 79,
+    "Target_Spot": 85,
+    "Leaf_Mold": 76,
+}
 
 # ─────────────────────────────────────────
 # BOUCLE D'ENVOI
 # ─────────────────────────────────────────
-while True:
-    # Choisir une image aléatoire
-    img_path = random.choice(all_images)
+try:
+    while True:
+        img_path = random.choice(all_images)
+        classe   = os.path.basename(os.path.dirname(img_path))
+        fichier  = os.path.basename(img_path)
+        taille   = os.path.getsize(img_path)
 
-    # Lire et encoder en base64 (comme un ESP32-CAM le ferait)
-    with open(img_path, "rb") as f:
-        image_bytes  = f.read()
-        image_b64    = base64.b64encode(image_bytes)
+        # Déterminer statut et confiance
+        est_saine = any(s.lower() in classe.lower() for s in MALADIES_SAINES)
+        confidence = NIVEAUX_CONFIANCE.get(
+            next((k for k in NIVEAUX_CONFIANCE if k in classe), "healthy"),
+            random.randint(70, 95)
+        )
 
-    # Récupérer le nom de la classe depuis le dossier parent
-    classe = os.path.basename(os.path.dirname(img_path))
+        if est_saine:
+            status = "🟢 Saine"
+            risque = 0
+        elif confidence > 85:
+            status = "🔴 Maladie détectée"
+            risque = 2
+        else:
+            status = "🟡 Risque modéré"
+            risque = 1
 
-    # Publier
-    client.publish(TOPIC_IMAGE, image_b64)
+        # Payload sans image
+        payload = json.dumps({
+            "classe":     classe,
+            "fichier":    fichier,
+            "taille_kb":  round(taille / 1024, 1),
+            "status":     status,
+            "confidence": confidence,
+            "risque":     risque,
+            "time":       int(time.time())
+        })
 
-    print(f"📤 Image envoyée : {classe}")
-    print(f"   Fichier : {os.path.basename(img_path)}")
-    print(f"   Taille  : {len(image_bytes) / 1024:.1f} KB")
-    print(f"   Prochain envoi dans {INTERVALLE}s...\n")
+        result = client.publish(TOPIC_IMAGE, payload, qos=1)
 
-    time.sleep(INTERVALLE)
+        print(f"📤 Envoi    : {classe}/{fichier}")
+        print(f"   Status   : {status}")
+        print(f"   Confiance: {confidence}%")
+        print(f"   Payload  : {len(payload)} octets")
+        print(f"   Prochain envoi dans {INTERVALLE}s...\n")
+
+        time.sleep(INTERVALLE)
+
+except KeyboardInterrupt:
+    print("\n🛑 Arrêt du simulateur.")
+    client.loop_stop()
+    client.disconnect()
